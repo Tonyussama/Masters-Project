@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# MATLAB / Data
+*.mat
+*.fig
+matlab_crash_dump.*
+
+# macOS system files
+.DS_Store
+
+# Large Images/Results (Optional: remove if you want to track them)
+# *.png
+# *.jpg
