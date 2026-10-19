@@ -16,3 +16,16 @@ matlab_crash_dump.*
 # Large Images/Results (Optional: remove if you want to track them)
 # *.png
 # *.jpg
+
+# Large model files and datasets
+*.pth
+*.npz
+outputs/
+
+# Rust build artifacts
+target/
+*.so
+
+# Images
+*.png
+*.jpg
