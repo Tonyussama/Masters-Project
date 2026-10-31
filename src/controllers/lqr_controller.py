@@ -3,11 +3,11 @@ from scipy.linalg import solve_discrete_are, inv
 
 
 class LQRController:
-    """Linear Quadratic Regulator with gain scheduling for path following."""
+    """LQR controller with proper linearization and gain scheduling."""
     
     def __init__(self, v_ref=0.2, dt=0.03):
         """
-        Initialize LQR controller with gain scheduling.
+        Initialize LQR controller.
         
         Args:
             v_ref: Reference forward velocity
@@ -16,95 +16,150 @@ class LQRController:
         self.v_ref = v_ref
         self.dt = dt
         
-        # LQR weights (tuned for tight tracking)
-        self.Q = np.diag([5.0, 0.5, 10.0])  # State cost [e_lat, e_lon, e_theta]
-        self.R = np.diag([0.3, 0.3])         # Control cost [v, omega]
-        
-        # Pre-compute gains for different curvatures (gain scheduling)
-        self.curvature_bins = np.linspace(-5, 5, 21)  # 21 bins from -5 to 5
-        self.gain_schedule = {}
-        
-        # Compute LQR gains for each curvature bin
-        for k in self.curvature_bins:
-            A = np.array([
-                [1, self.v_ref * k * self.dt, -self.v_ref * self.dt],
-                [-self.v_ref * k * self.dt, 1, 0],
-                [0, 0, 1]
-            ])
-            B = np.array([
-                [self.dt, 0],
-                [0, self.v_ref * self.dt],
-                [0, self.dt]
-            ])
-            
-            P = solve_discrete_are(A, B, self.Q, self.R)
-            K = inv(self.R + B.T @ P @ B) @ B.T @ P @ A
-            self.gain_schedule[k] = K
+        # LQR weights
+        self.Q = np.diag([100.0, 100.0, 50.0])  # State cost [e_along, e_cross, e_theta]
+        self.R = np.diag([0.1, 0.1])         # Control cost [s, omega]
         
         # Control limits
-        self.v_min, self.v_max = 0.01, 0.4
-        self.omega_min, self.omega_max = -4.0, 4.0
-    
-    def _get_gain(self, curvature):
-        """Get LQR gain for given curvature using interpolation."""
-        # Clamp curvature to bin range
-        k_clamped = np.clip(curvature, self.curvature_bins[0], self.curvature_bins[-1])
+        self.s_min, self.s_max = 0.01, 0.4
+        self.omega_min, self.omega_max = -7.0, 7.0
         
-        # Find nearest bins
-        idx = np.searchsorted(self.curvature_bins, k_clamped)
-        if idx == 0:
-            return self.gain_schedule[self.curvature_bins[0]]
-        elif idx >= len(self.curvature_bins):
-            return self.gain_schedule[self.curvature_bins[-1]]
-        else:
-            # Linear interpolation
-            k1, k2 = self.curvature_bins[idx-1], self.curvature_bins[idx]
-            K1, K2 = self.gain_schedule[k1], self.gain_schedule[k2]
-            alpha = (k_clamped - k1) / (k2 - k1) if k2 != k1 else 0.5
-            return (1 - alpha) * K1 + alpha * K2
+        # Store reference path
+        self.x_ref = None
+        self.y_ref = None
+        self.theta_ref = None
+        self.t_param = None
+        
+        # Precomputed gains and reference controls
+        self.gains = []
+        self.v_ref_array = []
+        self.omega_ref_array = []
+        
+        # For nearest-point search
+        self.prev_idx = 0
     
-    def get_control(self, state, path_state):
+    def set_reference(self, x_ref, y_ref, theta_ref, t_param):
+        """Set reference path and precompute LQR gains."""
+        self.x_ref = x_ref
+        self.y_ref = y_ref
+        self.theta_ref = theta_ref
+        self.t_param = t_param
+        
+        n = len(x_ref)
+        self.gains = []
+        self.v_ref_array = np.zeros(n)
+        self.omega_ref_array = np.zeros(n)
+        
+        # Assume dθ_p/dt ≈ 0.2 rad/s
+        dtheta_p_dt = 0.2
+        
+        for i in range(n):
+            j = (i + 1) % n
+            dx = x_ref[j] - x_ref[i]
+            dy = y_ref[j] - y_ref[i]
+            ds = np.hypot(dx, dy) + 1e-8
+            dtheta = np.arctan2(np.sin(theta_ref[j] - theta_ref[i]), 
+                               np.cos(theta_ref[j] - theta_ref[i]))
+            
+            # Reference controls
+            v_r = ds * dtheta_p_dt
+            omega_r = dtheta * dtheta_p_dt
+            
+            self.v_ref_array[i] = v_r
+            self.omega_ref_array[i] = omega_r
+            
+            # Linearize around reference point
+            # Error state: e = [e_along, e_cross, e_theta]
+            # Dynamics: de/dt = [v_r - v, omega_r - omega, -omega]
+            # Discrete: e[k+1] = A*e[k] + B*δu
+            # where δu = [v - v_r, omega - omega_r]
+            
+            A = np.eye(3) + self.dt * np.array([
+                [0, 0, 0],
+                [0, 0, v_r],
+                [0, 0, 0]
+            ])
+            
+            B = self.dt * np.array([
+                [-1, 0],
+                [0, 0],
+                [0, -1]
+            ])
+            
+            # Solve DARE
+            P = solve_discrete_are(A, B, self.Q, self.R)
+            K = inv(self.R + B.T @ P @ B) @ B.T @ P @ A
+            
+            self.gains.append(K)
+    
+    def _find_nearest_point(self, x, y):
+        """Find nearest point on reference path using windowed search."""
+        window = 50
+        n = len(self.x_ref)
+        
+        start = max(0, self.prev_idx - window)
+        end = min(n, self.prev_idx + window)
+        
+        idx = start
+        min_dist = float('inf')
+        
+        for i in range(start, end):
+            dx = x - self.x_ref[i]
+            dy = y - self.y_ref[i]
+            dist = dx*dx + dy*dy
+            if dist < min_dist:
+                min_dist = dist
+                idx = i
+        
+        self.prev_idx = idx
+        return idx
+    
+    def get_control(self, aug_state):
         """
-        Compute LQR control action with gain scheduling.
+        Compute LQR control action.
         
         Args:
-            state: Current robot state [x, y, theta]
-            path_state: Reference path state [x_ref, y_ref, theta_ref, k_ref]
+            aug_state: Augmented state [x, y, theta, theta_p]
         
         Returns:
-            Control [v, omega]
+            Control [s, omega, v]
         """
-        x, y, theta = state
-        x_ref, y_ref, theta_ref, k_ref = path_state
+        x, y, theta, theta_p = aug_state
         
-        # Transform error to path frame
-        cos_ref = np.cos(theta_ref)
-        sin_ref = np.sin(theta_ref)
+        # Find nearest point on reference
+        idx = self._find_nearest_point(x, y)
         
-        e_lat = (x - x_ref) * cos_ref + (y - y_ref) * sin_ref
-        e_lon = -(x - x_ref) * sin_ref + (y - y_ref) * cos_ref
-        e_theta = theta - theta_ref
+        x_ref_pt = self.x_ref[idx]
+        y_ref_pt = self.y_ref[idx]
+        theta_ref_pt = self.theta_ref[idx]
         
-        # Normalize angle error
+        # Transform error to path frame (FIXED: swapped e_along and e_cross)
+        cos_ref = np.cos(theta_ref_pt)
+        sin_ref = np.sin(theta_ref_pt)
+        
+        dx = x - x_ref_pt
+        dy = y - y_ref_pt
+        
+        e_along = dx * cos_ref + dy * sin_ref  # Along-track error
+        e_cross = -dx * sin_ref + dy * cos_ref  # Cross-track error
+        e_theta = theta - theta_ref_pt
         e_theta = np.arctan2(np.sin(e_theta), np.cos(e_theta))
         
-        # Get gain for current curvature
-        K = self._get_gain(k_ref)
-        
         # LQR control
-        error = np.array([e_lat, e_lon, e_theta])
-        u = -K @ error
+        error = np.array([e_along, e_cross, e_theta])
+        K = self.gains[idx]
+        delta_u = -K @ error
         
-        # Feedforward terms
-        v_ff = self.v_ref
-        omega_ff = self.v_ref * k_ref
+        # Reference controls
+        v_r = self.v_ref_array[idx]
+        omega_r = self.omega_ref_array[idx]
         
         # Total control
-        v = v_ff + u[0]
-        omega = omega_ff + u[1]
+        s = v_r + delta_u[0]
+        omega = omega_r + delta_u[1]
         
         # Apply constraints
-        v = np.clip(v, self.v_min, self.v_max)
+        s = np.clip(s, self.s_min, self.s_max)
         omega = np.clip(omega, self.omega_min, self.omega_max)
         
-        return np.array([v, omega])
+        return np.array([s, omega, v_r])

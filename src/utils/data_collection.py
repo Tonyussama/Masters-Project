@@ -4,7 +4,10 @@ from tqdm import tqdm
 try:
     from .reference import find_projection_index
 except ImportError:
-    from src.utils.reference import find_projection_index
+    try:
+        from src.utils.reference import find_projection_index
+    except ImportError:
+        from utils.reference import find_projection_index
 
 
 class MPCDataCollector:
@@ -99,27 +102,34 @@ class MPCDataCollector:
         
         return features
     
-    def collect_data_corridor(self, num_anchors=1000, offset_distance=0.1):
+    def collect_data_corridor(self, num_anchors=1000, offset_distance=0.1, heading_error_range=np.pi/6, keep_failures=True):
         """
         Collect training data using corridor experiment methodology.
         
         Args:
             num_anchors: Number of anchor points along the path
             offset_distance: Distance d for the 3x3 grid offsets
+            heading_error_range: Maximum heading error to add to seeds (default: 30 degrees)
+            keep_failures: Whether to keep MPC failure cases (default: True)
         
         Returns:
             states: Array of geometric states
             references: Array of reference features
             controls: Array of control actions
+            failure_info: Dictionary with failure statistics (if keep_failures=True)
         """
         states = []
         references = []
         controls = []
+        failure_states = []
+        failure_count = 0
         
         print(f"Collecting training data using corridor experiment methodology...")
         print(f"  - Number of anchors: {num_anchors}")
         print(f"  - 3x3 grid per anchor: {num_anchors * 9} total seeds")
         print(f"  - Offset distance: {offset_distance} m")
+        print(f"  - Heading error range: ±{heading_error_range:.2f} rad ({np.degrees(heading_error_range):.1f}°)")
+        print(f"  - Keep MPC failures: {keep_failures}")
         
         # Step 1: Anchor Point Sampling
         # Dense sampling of anchor points along the reference trajectory
@@ -155,8 +165,10 @@ class MPCDataCollector:
                     x = x_anchor + lat_offset * normal[0] + lon_offset * tangent[0]
                     y = y_anchor + lat_offset * normal[1] + lon_offset * tangent[1]
                     
-                    # Heading aligned with local path tangent
-                    theta = theta_anchor
+                    # Add heading error (uniformly sampled from [-range, +range])
+                    heading_error = np.random.uniform(-heading_error_range, heading_error_range)
+                    theta = theta_anchor + heading_error
+                    theta = (theta + np.pi) % (2 * np.pi) - np.pi  # Wrap to [-pi, pi]
                     
                     # Path parameter matches anchor
                     theta_p = theta_p_anchor
@@ -186,11 +198,41 @@ class MPCDataCollector:
                         references.append(ref_features)
                         controls.append(u_optimal)
                         seed_count += 1
+                    else:
+                        failure_count += 1
+                        if keep_failures:
+                            failure_states.append({
+                                'state': aug_state[:3],
+                                'theta_p': theta_p,
+                                'exit_status': result.exit_status,
+                                'heading_error': heading_error
+                            })
         
         print(f"Successfully collected {len(states)} samples out of {total_seeds} seeds")
         print(f"Convergence rate: {seed_count/total_seeds*100:.1f}%")
+        print(f"MPC failures: {failure_count} ({failure_count/total_seeds*100:.1f}%)")
         
-        return np.array(states), np.array(references), np.array(controls)
+        failure_info = None
+        if keep_failures and failure_count > 0:
+            failure_info = {
+                'count': failure_count,
+                'rate': failure_count / total_seeds,
+                'states': failure_states
+            }
+            print(f"  - Kept {len(failure_states)} failure cases for analysis")
+        
+        # Return block indices for block-based validation split
+        # Each anchor has 9 samples, so we can assign block IDs
+        block_ids = []
+        sample_idx = 0
+        for anchor_idx in range(len(anchor_indices)):
+            for _ in range(9):
+                if sample_idx < len(states):
+                    block_ids.append(anchor_idx)
+                    sample_idx += 1
+        block_ids = np.array(block_ids)
+        
+        return np.array(states), np.array(references), np.array(controls), failure_info, block_ids
     
     def collect_data(self, num_samples=8000, add_noise=True):
         """

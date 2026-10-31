@@ -139,27 +139,29 @@ class MPCController:
         
         return self.solver
     
-    def solve(self, aug_state, x_ref, y_ref, theta_ref):
+    def solve(self, aug_state, x_ref, y_ref, theta_ref, u_init=None):
         """
         Solve MPC problem for current state.
-        
+
         Args:
             aug_state: Augmented state [x, y, theta, theta_p]
             x_ref: Reference x positions over horizon
             y_ref: Reference y positions over horizon
             theta_ref: Reference theta over horizon
-        
+            u_init: Optional initial guess for control sequence
+
         Returns:
             Optimal control sequence [s, omega, v] * N
         """
         if not self.built:
             raise RuntimeError("MPC optimizer not built. Call build_optimizer() first.")
-        
+
         p_vector = np.concatenate([aug_state, x_ref, y_ref, theta_ref])
-        u_init = [0.01] * (self.nu * self.N)
-        
+        if u_init is None:
+            u_init = [0.01] * (self.nu * self.N)
+
         result = self.solver.run(p=p_vector, initial_guess=u_init)
-        
+
         if result.exit_status == 'Converged':
             return result.solution
         else:
@@ -169,6 +171,6 @@ class MPCController:
         """Get only the first control action, with optional warm start and timing."""
         if u_init is None:
             u_init = [0.01] * (self.nu * self.N)
-        
+
         u_sequence = self.solve(aug_state, x_ref, y_ref, theta_ref, u_init=u_init)
-        return u_sequence[0:self.nu], self.last_solve_time_ms
+        return u_sequence[0:self.nu]

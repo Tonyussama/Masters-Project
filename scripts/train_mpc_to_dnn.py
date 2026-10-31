@@ -64,6 +64,37 @@ def simulate_trajectory(controller, initial_state, ts, steps=300):
     return np.array(trajectory), np.array(controls)
 
 
+def compute_tracking_error(trajectory, x_ref_array, y_ref_array, t_param):
+    """Compute RMS and max tracking error for a trajectory.
+    
+    Args:
+        trajectory: Array of augmented states
+        x_ref_array: Reference x positions
+        y_ref_array: Reference y positions
+        t_param: Path parameter array
+    
+    Returns:
+        rms_error: RMS tracking error in meters
+        max_error: Maximum tracking error in meters
+    """
+    errors = []
+    for aug_state in trajectory:
+        # Find closest point on reference path
+        idx = find_projection_index(aug_state[:2], x_ref_array, y_ref_array)
+        x_path = x_ref_array[idx]
+        y_path = y_ref_array[idx]
+        
+        # Compute cross-track error
+        error = np.sqrt((aug_state[0] - x_path)**2 + (aug_state[1] - y_path)**2)
+        errors.append(error)
+    
+    errors = np.array(errors)
+    rms_error = np.sqrt(np.mean(errors**2))
+    max_error = np.max(errors)
+    
+    return rms_error, max_error
+
+
 def main():
     print("="*70)
     print(" MPC to DNN: Complete Training Pipeline")
@@ -103,13 +134,17 @@ def main():
     # =========================================
     collector = MPCDataCollector(solver, t_param, x_ref_array, y_ref_array, 
                                  theta_ref_array, N, nu, ts, v_ref)
-    states, references, controls = collector.collect_data_corridor(num_anchors=1000, offset_distance=0.1)
+    states, references, controls, failure_info, block_ids = collector.collect_data_corridor(
+        num_anchors=10000, offset_distance=0.1,
+        heading_error_range=np.pi/6, keep_failures=True
+    )
     
     # Save dataset
     np.savez('data/mpc_dataset.npz',
              states=states,
              references=references,
              controls=controls,
+             block_ids=block_ids,
              x_ref_array=x_ref_array,
              y_ref_array=y_ref_array,
              t_param=t_param,
@@ -121,8 +156,13 @@ def main():
     # PART 4: Prepare Training Data
     # =========================================
     print("\n[5/7] Preparing training data...")
+    # Use larger batch size for GPU (256), smaller for CPU (32)
+    batch_size = 256 if torch.cuda.is_available() else 32
+    print(f"      Using batch_size={batch_size} ({'GPU' if torch.cuda.is_available() else 'CPU'})")
+    
     train_loader, val_loader, dataset = prepare_dataloaders(
-        states, references, controls, train_split=0.8, batch_size=32
+        references, controls, train_split=0.8, batch_size=batch_size,
+        block_ids=block_ids, standardize_targets=True
     )
     print(f"      Training: {len(train_loader.dataset)} samples | Validation: {len(val_loader.dataset)} samples")
     
@@ -130,12 +170,15 @@ def main():
     # PART 5: Train Neural Network
     # =========================================
     ref_feature_dim = references.shape[1]
-    print(f"      Network input: state(3) + references({ref_feature_dim}) = {3 + ref_feature_dim} dims")
+    print(f"      Network input: references({ref_feature_dim}) dims (robot-frame only)")
     
-    model = MPCNeuralNetwork(state_dim=3, ref_feature_dim=ref_feature_dim, 
-                            hidden_dims=[128, 128, 64, 32], output_dim=3)
+    model = MPCNeuralNetwork(
+        ref_feature_dim=ref_feature_dim,
+        hidden_dims=[1024, 1024, 512, 256, 128],
+        output_dim=2
+    )
     
-    trained_model = train_model(model, train_loader, val_loader, states, references, epochs=300, lr=0.001)
+    trained_model = train_model(model, train_loader, val_loader, references, epochs=1000, lr=0.001, seed=42, batch_size=batch_size)
     
     # Save model
     torch.save(trained_model.state_dict(), 'models/final_mpc_dnn_model.pth')
@@ -145,7 +188,7 @@ def main():
     # PART 6: Test DNN Controller
     # =========================================
     print("[7/7] Testing DNN controller on multiple initial conditions...")
-    dnn_controller = DNNController(trained_model, collector, t_param)
+    dnn_controller = DNNController(trained_model, collector, t_param, v_ref=v_ref)
     
     test_initial_states = [
         np.array([0.3, 0.0, np.pi/3]),
@@ -157,11 +200,22 @@ def main():
     
     trajectories = []
     controls_list = []
+    tracking_errors = []
     
     for i, init_state in enumerate(test_initial_states):
         traj, controls = simulate_trajectory(dnn_controller, init_state, ts, steps=300)
         trajectories.append(traj)
         controls_list.append(controls)
+        
+        rms_error, max_error = compute_tracking_error(traj, x_ref_array, y_ref_array, t_param)
+        tracking_errors.append({'rms': rms_error, 'max': max_error})
+        print(f"  Test {i+1}: RMS = {rms_error*1000:.2f} mm, Max = {max_error*1000:.2f} mm")
+    
+    # Print summary statistics
+    rms_errors = [e['rms'] for e in tracking_errors]
+    max_errors = [e['max'] for e in tracking_errors]
+    print(f"\n  Average RMS error: {np.mean(rms_errors)*1000:.2f} mm")
+    print(f"  Average Max error: {np.mean(max_errors)*1000:.2f} mm")
     
     plot_comprehensive_results(trajectories, controls_list, x_ref_array, y_ref_array, test_initial_states, ts)
     
